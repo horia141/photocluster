@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,19 @@ def _gps_to_decimal(coords: tuple, ref: bytes | str) -> float:
     if ref in (b"S", b"W", "S", "W"):
         decimal = -decimal
     return decimal
+
+
+_DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+def _date_from_filename(path: Path) -> Optional[datetime]:
+    m = _DATE_PREFIX_RE.match(path.stem)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y-%m-%d")
+        except ValueError:
+            pass
+    return None
 
 
 def _extract_exif(path: Path) -> tuple[Optional[datetime], Optional[float], Optional[float]]:
@@ -126,6 +140,9 @@ def scan(source: Path, cache_dir: Optional[Path] = None) -> list[Photo]:
                     (str(path), mtime, ts_str, cached_lat, cached_lon),
                 )
                 conn.commit()
+
+            if photo_ts is None:
+                photo_ts = _date_from_filename(path)
 
             photos.append(Photo(path=path, mtime=mtime, timestamp=photo_ts, lat=cached_lat, lon=cached_lon))
             progress.advance(task)

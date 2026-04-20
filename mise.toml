@@ -1,0 +1,11 @@
+
+[settings]
+python.uv_venv_auto = false
+lockfile = true
+
+[tools]
+"github:cli/cli" = "latest"
+python = "3.13.0"
+uv = "latest"
+
+
