@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from datetime import datetime
 from typing import Literal, Optional
 
@@ -10,6 +11,15 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static
+
+try:
+    from PIL import Image as PilImage, ImageOps
+    from textual_image.widget import Image as ImageWidget
+    _HAS_IMAGE = True
+except ImportError:
+    _HAS_IMAGE = False
+
+_PREVIEW_WIDTH_PX = 400
 
 from .models import Cluster, Photo
 
@@ -182,6 +192,9 @@ class ClusterReviewApp(App[list[Cluster]]):
         Binding("k", "toggle_skip", "Skip/Accept"),
         Binding("m", "merge", "Merge"),
         Binding("s", "split", "Split"),
+        Binding("e", "open_earliest", "Earliest"),
+        Binding("l", "open_latest", "Latest"),
+        Binding("f", "explore_folder", "Folder"),
         Binding("g", "go", "Go (apply)"),
         Binding("enter", "go", "Go (apply)", show=False),
         Binding("q", "quit_app", "Quit"),
@@ -195,8 +208,32 @@ class ClusterReviewApp(App[list[Cluster]]):
         padding: 1 2;
         border-bottom: solid $primary;
     }
-    #cluster-table {
+    #main-layout {
         height: 1fr;
+    }
+    #cluster-table {
+        width: 1fr;
+    }
+    #preview-pane {
+        width: 1fr;
+        min-width: 36;
+        border-left: solid $primary;
+        padding: 0 1;
+    }
+    #preview-label {
+        height: 1;
+        color: $text-muted;
+        margin: 1 0;
+        text-overflow: ellipsis;
+    }
+    #preview-image {
+        width: auto;
+        height: auto;
+    }
+    #preview-placeholder {
+        height: 1fr;
+        content-align: center middle;
+        color: $text-disabled;
     }
     """
 
@@ -221,15 +258,29 @@ class ClusterReviewApp(App[list[Cluster]]):
             f"  Mode: [bold]{self._mode}[/bold]   "
             f"Destination: [bold]{self._output}[/bold]   "
             f"  [dim]r[/dim]:Rename  [dim]k[/dim]:Skip  [dim]m[/dim]:Merge  [dim]s[/dim]:Split  "
+            f"[dim]e[/dim]:Earliest  [dim]l[/dim]:Latest  [dim]f[/dim]:Folder  "
             f"[dim]g/Enter[/dim]:Apply  [dim]q[/dim]:Quit",
             id="info-bar",
             markup=True,
         )
-        yield DataTable(id="cluster-table", cursor_type="row")
+        with Horizontal(id="main-layout"):
+            yield DataTable(id="cluster-table", cursor_type="row")
+            with Vertical(id="preview-pane"):
+                yield Label("", id="preview-label")
+                if _HAS_IMAGE:
+                    yield ImageWidget(id="preview-image")
+                else:
+                    yield Static(
+                        "pip install textual-image\nfor inline previews",
+                        id="preview-placeholder",
+                    )
         yield Footer()
 
     def on_mount(self) -> None:
         self._build_table()
+        cluster = self._current_cluster()
+        if cluster is not None:
+            self._update_preview(cluster)
 
     # ------------------------------------------------------------------
     # Table helpers
@@ -287,6 +338,35 @@ class ClusterReviewApp(App[list[Cluster]]):
         col_keys = ["id", "name", "photos", "dates", "status", "type"]
         for key, value in zip(col_keys, cells):
             table.update_cell(row_key, key, value, update_width=True)
+
+    @on(DataTable.RowHighlighted, "#cluster-table")
+    def _on_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.row_key is None:
+            return
+        cluster = self._cluster_by_id(int(str(event.row_key.value)))
+        if cluster is not None:
+            self._update_preview(cluster)
+
+    def _update_preview(self, cluster: Cluster) -> None:
+        label = self.query_one("#preview-label", Label)
+        photos = self._sorted_photos_by_time(cluster)
+        if not photos:
+            label.update("no photos")
+            return
+        photo = photos[0]
+        label.update(photo.path.name)
+        if _HAS_IMAGE:
+            try:
+                img = PilImage.open(photo.path)
+                img = ImageOps.exif_transpose(img)
+                img = img.convert("RGB")
+                orig_w, orig_h = img.size
+                target_h = int(orig_h * _PREVIEW_WIDTH_PX / orig_w)
+                img = img.resize((_PREVIEW_WIDTH_PX, target_h), PilImage.LANCZOS)
+                widget = self.query_one("#preview-image", ImageWidget)
+                widget.image = img  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Actions
@@ -374,6 +454,41 @@ class ClusterReviewApp(App[list[Cluster]]):
             self.notify(f"Split into {len(before)} + {len(after)} photos.")
 
         self.push_screen(SplitDialog(), _apply)
+
+    def _sorted_photos_by_time(self, cluster: Cluster) -> list[Photo]:
+        with_ts = [p for p in cluster.photos if p.timestamp is not None]
+        without_ts = [p for p in cluster.photos if p.timestamp is None]
+        return sorted(with_ts, key=lambda p: p.timestamp) + without_ts  # type: ignore[arg-type]
+
+    def action_open_earliest(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        photos = self._sorted_photos_by_time(cluster)
+        if not photos:
+            self.notify("No photos in cluster.", severity="warning")
+            return
+        subprocess.Popen(["open", str(photos[0].path)])
+
+    def action_open_latest(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        photos = self._sorted_photos_by_time(cluster)
+        if not photos:
+            self.notify("No photos in cluster.", severity="warning")
+            return
+        subprocess.Popen(["open", str(photos[-1].path)])
+
+    def action_explore_folder(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        if not cluster.photos:
+            self.notify("No photos in cluster.", severity="warning")
+            return
+        folder = cluster.photos[0].path.parent
+        subprocess.Popen(["open", str(folder)])
 
     def action_go(self) -> None:
         self._resolve_merges()
