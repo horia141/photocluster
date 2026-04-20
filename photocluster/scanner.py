@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +77,20 @@ def _extract_exif(path: Path) -> tuple[Optional[datetime], Optional[float], Opti
     return timestamp, lat, lon
 
 
+_DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+def _date_from_filename(path: Path) -> Optional[datetime]:
+    """Return midnight datetime if the stem starts with YYYY-mm-dd, else None."""
+    m = _DATE_PREFIX_RE.match(path.stem)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
 def scan(source: Path, cache_dir: Optional[Path] = None) -> list[Photo]:
     """Walk source recursively, extract EXIF, return Photo list (SQLite-cached)."""
     if cache_dir is None:
@@ -119,6 +134,8 @@ def scan(source: Path, cache_dir: Optional[Path] = None) -> list[Photo]:
                 photo_ts = datetime.fromisoformat(ts_str) if ts_str else None
             else:
                 photo_ts, cached_lat, cached_lon = _extract_exif(path)
+                if photo_ts is None:
+                    photo_ts = _date_from_filename(path)
                 ts_str = photo_ts.isoformat() if photo_ts else None
                 conn.execute(
                     "INSERT OR REPLACE INTO scan_cache (path, mtime, timestamp, lat, lon) "

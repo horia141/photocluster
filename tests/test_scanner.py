@@ -12,7 +12,7 @@ import piexif
 import pytest
 from PIL import Image
 
-from photocluster.scanner import CACHE_FILENAME, _extract_exif, _gps_to_decimal, _init_cache, scan
+from photocluster.scanner import CACHE_FILENAME, _date_from_filename, _extract_exif, _gps_to_decimal, _init_cache, scan
 
 
 # ---------------------------------------------------------------------------
@@ -160,3 +160,48 @@ def test_scan_recursive(tmp_path):
     paths = {p.path for p in photos}
     assert tmp_path / "root.jpg" in paths
     assert subdir / "sub.jpg" in paths
+
+
+# ---------------------------------------------------------------------------
+# _date_from_filename
+# ---------------------------------------------------------------------------
+
+
+def test_date_from_filename_exact():
+    assert _date_from_filename(Path("2024-07-14.jpg")) == datetime(2024, 7, 14)
+
+
+def test_date_from_filename_prefix():
+    assert _date_from_filename(Path("2024-07-14_holiday.jpg")) == datetime(2024, 7, 14)
+    assert _date_from_filename(Path("2024-07-14 Rome sunset.jpg")) == datetime(2024, 7, 14)
+
+
+def test_date_from_filename_no_match():
+    assert _date_from_filename(Path("IMG_1234.jpg")) is None
+    assert _date_from_filename(Path("photo.jpg")) is None
+    assert _date_from_filename(Path("20240714.jpg")) is None  # no dashes
+
+
+def test_date_from_filename_invalid_date():
+    assert _date_from_filename(Path("2024-13-99.jpg")) is None  # month 13 is invalid
+
+
+def test_scan_falls_back_to_filename_date(tmp_path):
+    # JPEG with no EXIF — date should come from the filename
+    img = Image.new("RGB", (10, 10))
+    jpg = tmp_path / "2024-07-14_no_exif.jpg"
+    img.save(jpg, format="JPEG")
+
+    photos = scan(tmp_path)
+    assert len(photos) == 1
+    assert photos[0].timestamp == datetime(2024, 7, 14)
+
+
+def test_scan_exif_takes_priority_over_filename(tmp_path):
+    # EXIF date is 2023-01-01 but filename says 2024-07-14 — EXIF wins
+    jpg = tmp_path / "2024-07-14_with_exif.jpg"
+    _make_jpeg_with_exif(jpg, dt_str="2023:01:01 12:00:00")
+
+    photos = scan(tmp_path)
+    assert len(photos) == 1
+    assert photos[0].timestamp == datetime(2023, 1, 1, 12, 0, 0)
