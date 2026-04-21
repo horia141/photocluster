@@ -157,6 +157,8 @@ class ClusterReviewApp(App[list[Cluster]]):
         Binding("c",     "select_cancel",   "", show=False),
         Binding("x",     "select_extract",  "", show=False),
         Binding("a",     "select_move",     "", show=False),
+        Binding("y",     "yank",            "", show=False),
+        Binding(";",     "send_to_random",  "", show=False),
         Binding("g",     "go",              "", show=False),
         Binding("enter", "go",              "", show=False),
         Binding("q",     "quit_app",        "", show=False),
@@ -255,7 +257,7 @@ class ClusterReviewApp(App[list[Cluster]]):
                 "  |  "
                 "e:Earliest  b:Bisect  l:Latest  n:Next day"
                 "  |  "
-                "s:Select  d:Range  c:Deselect  x:Extract  a:Move"
+                "s:Select  d:Range  c:Deselect  x:Extract  a:Move  y:Yank  ;:Random"
                 "  |  "
                 "o:Open  f:Folder"
                 "  |  "
@@ -281,7 +283,11 @@ class ClusterReviewApp(App[list[Cluster]]):
 
     def _sort_clusters(self) -> None:
         self._clusters.sort(
-            key=lambda c: (c.date_range[0] is None, c.date_range[0] or datetime.min)
+            key=lambda c: (
+                c.name == "Random",
+                c.date_range[0] is None,
+                c.date_range[0] or datetime.min,
+            )
         )
 
     def _build_table(self) -> None:
@@ -601,6 +607,93 @@ class ClusterReviewApp(App[list[Cluster]]):
             self.notify(f"Moved {len(selected)} photo(s) to '{target.name[:30]}'.")
 
         self.push_screen(MergeDialog(self._clusters, exclude_id=cluster.id, label="Move selection to which cluster?"), _apply)
+
+    def action_yank(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+
+        if self._selection:
+            to_remove = self._selection.copy()
+            self._selection.clear()
+        else:
+            photos = self._sorted_photos_by_time(cluster)
+            cur = self.query_one("#files-table", DataTable).cursor_row
+            if not (0 <= cur < len(photos)):
+                return
+            to_remove = {str(photos[cur].path)}
+
+        cluster.photos = [p for p in cluster.photos if str(p.path) not in to_remove]
+        count = len(to_remove)
+
+        if not cluster.photos:
+            cluster_table = self.query_one("#cluster-table", DataTable)
+            cur_row = cluster_table.cursor_row
+            self._clusters = [c for c in self._clusters if c.id != cluster.id]
+            self._build_table()
+            cluster_table.move_cursor(row=max(0, cur_row - 1))
+            new_cluster = self._current_cluster()
+            if new_cluster:
+                self._populate_files_table(new_cluster)
+            self.notify(f"Yanked {count} photo(s); cluster was empty and removed.")
+        else:
+            self._refresh_row(cluster)
+            self._populate_files_table(cluster)
+            self.notify(f"Yanked {count} photo(s) from cluster.")
+
+    def _get_or_create_random_cluster(self) -> Cluster:
+        for c in self._clusters:
+            if c.name == "Random":
+                return c
+        new_id = max((c.id for c in self._clusters), default=-1) + 1
+        random_cluster = Cluster(
+            id=new_id,
+            name="Random",
+            photos=[],
+            locked=False,
+            action="accept",
+        )
+        self._clusters.append(random_cluster)
+        return random_cluster
+
+    def action_send_to_random(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        if cluster.name == "Random":
+            self.notify("Already in Random.", severity="warning")
+            return
+
+        if self._selection:
+            to_move = {str(p.path) for p in cluster.photos if str(p.path) in self._selection}
+            self._selection.clear()
+        else:
+            photos = self._sorted_photos_by_time(cluster)
+            cur = self.query_one("#files-table", DataTable).cursor_row
+            if not (0 <= cur < len(photos)):
+                return
+            to_move = {str(photos[cur].path)}
+
+        moving = [p for p in cluster.photos if str(p.path) in to_move]
+        cluster.photos = [p for p in cluster.photos if str(p.path) not in to_move]
+
+        random_cluster = self._get_or_create_random_cluster()
+        random_cluster.photos.extend(moving)
+
+        if not cluster.photos:
+            cluster_table = self.query_one("#cluster-table", DataTable)
+            cur_row = cluster_table.cursor_row
+            self._clusters = [c for c in self._clusters if c.id != cluster.id]
+            self._build_table()
+            cluster_table.move_cursor(row=max(0, cur_row - 1))
+            new_cluster = self._current_cluster()
+            if new_cluster:
+                self._populate_files_table(new_cluster)
+        else:
+            self._build_table()
+            self._populate_files_table(cluster)
+
+        self.notify(f"Moved {len(moving)} photo(s) to Random.")
 
     def _navigate_files_to(self, index: int) -> None:
         table = self.query_one("#files-table", DataTable)
