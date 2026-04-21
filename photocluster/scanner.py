@@ -34,6 +34,14 @@ def _init_cache(db_path: Path) -> sqlite3.Connection:
             value TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS geocode_cache (
+            lat  REAL NOT NULL,
+            lon  REAL NOT NULL,
+            name TEXT,
+            PRIMARY KEY (lat, lon)
+        )
+    """)
     conn.commit()
     row = conn.execute("SELECT value FROM cache_meta WHERE key = 'version'").fetchone()
     if row is None or row[0] != CACHE_VERSION:
@@ -100,6 +108,10 @@ def _extract_exif(path: Path) -> tuple[Optional[datetime], Optional[float], Opti
         pass
 
     return timestamp, lat, lon
+
+
+def cache_db_path(source: Path, cache_dir: Optional[Path] = None) -> Path:
+    return (cache_dir if cache_dir is not None else source) / CACHE_FILENAME
 
 
 def scan(source: Path, cache_dir: Optional[Path] = None) -> list[Photo]:

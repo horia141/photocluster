@@ -12,7 +12,7 @@ from rich.table import Table
 from .clusterer import cluster_photos, parse_time_gap
 from .executor import FileMode, apply_plan, undo_last_run
 from .geocoder import name_clusters
-from .scanner import scan
+from .scanner import cache_db_path, scan
 
 app = typer.Typer(
     name="photocluster",
@@ -88,7 +88,7 @@ def main(
         f"{sum(1 for c in clusters if not c.locked)} new)"
     )
 
-    name_clusters(clusters)
+    name_clusters(clusters, cache_db=cache_db_path(source))
 
     # --- JSON output ---------------------------------------------------------
     if json_output:
@@ -209,6 +209,24 @@ def debug_exif(
                 console.print(f"\n[red]Parse failed:[/red] {exc}")
         else:
             console.print("\n[yellow]Incomplete GPS tags — cannot parse coordinates.[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# Clear-cache command
+# ---------------------------------------------------------------------------
+
+
+@app.command(name="clear-cache")
+def clear_cache(
+    source: Path = typer.Argument(..., help="Source photo folder whose cache should be cleared."),
+) -> None:
+    """Delete the scan and geocode cache for SOURCE."""
+    db = cache_db_path(source)
+    if not db.exists():
+        console.print(f"[yellow]No cache found at {db}[/yellow]")
+        raise typer.Exit(0)
+    db.unlink()
+    console.print(f"[green]Deleted cache:[/green] {db}")
 
 
 # ---------------------------------------------------------------------------

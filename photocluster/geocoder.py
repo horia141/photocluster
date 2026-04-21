@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 import time
+from pathlib import Path
 from typing import Optional
 
 from geopy.exc import GeocoderServiceError, GeocoderTimedOut
@@ -11,6 +13,11 @@ from .models import Cluster
 
 _geolocator = Nominatim(user_agent="photocluster/0.1.0")
 _last_request: float = 0.0
+_GEO_PRECISION = 3  # decimal places (~111 m) — coarse enough to share hits across nearby clusters
+
+
+def _cache_key(lat: float, lon: float) -> tuple[float, float]:
+    return round(lat, _GEO_PRECISION), round(lon, _GEO_PRECISION)
 
 
 def _reverse_geocode(lat: float, lon: float) -> Optional[str]:
@@ -38,9 +45,36 @@ def _reverse_geocode(lat: float, lon: float) -> Optional[str]:
         return None
 
 
-def name_clusters(clusters: list[Cluster]) -> None:
+def name_clusters(clusters: list[Cluster], cache_db: Optional[Path] = None) -> None:
     """Assign proposed names to unlocked unnamed clusters (in-place)."""
     to_geocode = [c for c in clusters if not c.locked and not c.name and c.centroid_lat is not None]
+
+    conn: Optional[sqlite3.Connection] = None
+    if cache_db is not None:
+        conn = sqlite3.connect(cache_db)
+
+    def _lookup(lat: float, lon: float) -> Optional[str]:
+        if conn is None:
+            return None
+        clat, clon = _cache_key(lat, lon)
+        row = conn.execute(
+            "SELECT name FROM geocode_cache WHERE lat = ? AND lon = ?", (clat, clon)
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def _store(lat: float, lon: float, name: Optional[str]) -> None:
+        if conn is None:
+            return
+        clat, clon = _cache_key(lat, lon)
+        conn.execute(
+            "INSERT OR REPLACE INTO geocode_cache (lat, lon, name) VALUES (?, ?, ?)",
+            (clat, clon, name),
+        )
+        conn.commit()
+
+    # Split into cache hits and actual network requests
+    cache_hits = sum(1 for c in to_geocode if _lookup(c.centroid_lat, c.centroid_lon) is not None)  # type: ignore[arg-type]
+    need_fetch = len(to_geocode) - cache_hits
 
     with Progress(
         SpinnerColumn(),
@@ -57,9 +91,18 @@ def name_clusters(clusters: list[Cluster]) -> None:
             start, _ = cluster.date_range
             date_prefix = start.strftime("%Y.%m.%d") if start else "YYYY.MM.DD"
             progress.update(task, current=date_prefix)
-            city = _reverse_geocode(cluster.centroid_lat, cluster.centroid_lon)  # type: ignore[arg-type]
+
+            lat, lon = cluster.centroid_lat, cluster.centroid_lon  # type: ignore[assignment]
+            city = _lookup(lat, lon)
+            if city is None:
+                city = _reverse_geocode(lat, lon)
+                _store(lat, lon, city)
+
             cluster.name = f"{date_prefix} \u2013 {city}" if city else f"{date_prefix} \u2013 Untitled"
             progress.advance(task)
+
+    if conn is not None:
+        conn.close()
 
     # Handle clusters with no GPS
     for cluster in clusters:
