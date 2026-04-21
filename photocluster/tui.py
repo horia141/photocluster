@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Literal, Optional
 
 from rich.text import Text
-from textual import on
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -19,7 +19,7 @@ try:
 except ImportError:
     _HAS_IMAGE = False
 
-_PREVIEW_WIDTH_PX = 400
+_PREVIEW_WIDTH_PX = 900
 
 from .models import Cluster, Photo
 
@@ -188,12 +188,17 @@ class ClusterReviewApp(App[list[Cluster]]):
     TITLE = "photocluster"
 
     BINDINGS = [
+        Binding("left", "focus_left", "", show=False, priority=True),
+        Binding("right", "focus_right", "", show=False, priority=True),
         Binding("r", "rename", "Rename"),
         Binding("k", "toggle_skip", "Skip/Accept"),
         Binding("m", "merge", "Merge"),
         Binding("s", "split", "Split"),
         Binding("e", "open_earliest", "Earliest"),
+        Binding("b", "open_middle", "Bisect"),
         Binding("l", "open_latest", "Latest"),
+        Binding("n", "open_next_day", "Next day"),
+        Binding("o", "open_file", "Open"),
         Binding("f", "explore_folder", "Folder"),
         Binding("g", "go", "Go (apply)"),
         Binding("enter", "go", "Go (apply)", show=False),
@@ -212,7 +217,11 @@ class ClusterReviewApp(App[list[Cluster]]):
         height: 1fr;
     }
     #cluster-table {
+        width: 2fr;
+    }
+    #files-table {
         width: 1fr;
+        border-left: solid $primary;
     }
     #preview-pane {
         width: 1fr;
@@ -265,6 +274,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         )
         with Horizontal(id="main-layout"):
             yield DataTable(id="cluster-table", cursor_type="row")
+            yield DataTable(id="files-table", cursor_type="row")
             with Vertical(id="preview-pane"):
                 yield Label("", id="preview-label")
                 if _HAS_IMAGE:
@@ -277,10 +287,15 @@ class ClusterReviewApp(App[list[Cluster]]):
         yield Footer()
 
     def on_mount(self) -> None:
+        files_table = self.query_one("#files-table", DataTable)
+        files_table.add_column("#", key="idx", width=5)
+        files_table.add_column("File", key="name")
+        files_table.add_column("Time", key="time", width=14)
+        files_table.add_column("GPS", key="gps", width=10)
         self._build_table()
         cluster = self._current_cluster()
         if cluster is not None:
-            self._update_preview(cluster)
+            self._populate_files_table(cluster)
 
     # ------------------------------------------------------------------
     # Table helpers
@@ -340,37 +355,74 @@ class ClusterReviewApp(App[list[Cluster]]):
             table.update_cell(row_key, key, value, update_width=True)
 
     @on(DataTable.RowHighlighted, "#cluster-table")
-    def _on_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+    def _on_cluster_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.row_key is None:
             return
         cluster = self._cluster_by_id(int(str(event.row_key.value)))
         if cluster is not None:
-            self._update_preview(cluster)
+            self._populate_files_table(cluster)
 
-    def _update_preview(self, cluster: Cluster) -> None:
-        label = self.query_one("#preview-label", Label)
-        photos = self._sorted_photos_by_time(cluster)
-        if not photos:
-            label.update("no photos")
+    @on(DataTable.RowHighlighted, "#files-table")
+    def _on_file_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.row_key is None:
             return
-        photo = photos[0]
-        label.update(photo.path.name)
+        path_str = str(event.row_key.value)
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        photo = next((p for p in cluster.photos if str(p.path) == path_str), None)
+        if photo is not None:
+            self._update_preview(photo)
+
+    def _populate_files_table(self, cluster: Cluster) -> None:
+        table = self.query_one("#files-table", DataTable)
+        table.clear()
+        photos = self._sorted_photos_by_time(cluster)
+        for i, photo in enumerate(photos):
+            ts = photo.timestamp.strftime("%Y-%m-%d %H:%M") if photo.timestamp else "–"
+            gps = Text("no GPS", style="red") if not photo.has_gps else Text("ok", style="dim green")
+            table.add_row(str(i + 1), photo.path.name, ts, gps, key=str(photo.path))
+        if photos:
+            self._update_preview(photos[0])
+
+    @work(exclusive=True, thread=True)
+    def _update_preview(self, photo: Photo) -> None:
+        from textual.worker import get_current_worker
+        worker = get_current_worker()
+        self.call_from_thread(
+            self.query_one("#preview-label", Label).update, photo.path.name
+        )
+        if not _HAS_IMAGE:
+            return
+        try:
+            img = PilImage.open(photo.path)
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB")
+            orig_w, orig_h = img.size
+            target_h = int(orig_h * _PREVIEW_WIDTH_PX / orig_w)
+            img = img.resize((_PREVIEW_WIDTH_PX, target_h), PilImage.LANCZOS)
+            if not worker.is_cancelled:
+                self.call_from_thread(self._set_preview_image, img)
+        except Exception:
+            pass
+
+    def _set_preview_image(self, img: object) -> None:
         if _HAS_IMAGE:
-            try:
-                img = PilImage.open(photo.path)
-                img = ImageOps.exif_transpose(img)
-                img = img.convert("RGB")
-                orig_w, orig_h = img.size
-                target_h = int(orig_h * _PREVIEW_WIDTH_PX / orig_w)
-                img = img.resize((_PREVIEW_WIDTH_PX, target_h), PilImage.LANCZOS)
-                widget = self.query_one("#preview-image", ImageWidget)
-                widget.image = img  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            self.query_one("#preview-image", ImageWidget).image = img  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
+
+    def action_focus_left(self) -> None:
+        files_table = self.query_one("#files-table", DataTable)
+        if self.focused is files_table:
+            self.query_one("#cluster-table", DataTable).focus()
+
+    def action_focus_right(self) -> None:
+        cluster_table = self.query_one("#cluster-table", DataTable)
+        if self.focused is cluster_table:
+            self.query_one("#files-table", DataTable).focus()
 
     def action_rename(self) -> None:
         cluster = self._current_cluster()
@@ -460,6 +512,11 @@ class ClusterReviewApp(App[list[Cluster]]):
         without_ts = [p for p in cluster.photos if p.timestamp is None]
         return sorted(with_ts, key=lambda p: p.timestamp) + without_ts  # type: ignore[arg-type]
 
+    def _navigate_files_to(self, index: int) -> None:
+        table = self.query_one("#files-table", DataTable)
+        table.focus()
+        table.move_cursor(row=index)
+
     def action_open_earliest(self) -> None:
         cluster = self._current_cluster()
         if cluster is None:
@@ -468,7 +525,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         if not photos:
             self.notify("No photos in cluster.", severity="warning")
             return
-        subprocess.Popen(["open", str(photos[0].path)])
+        self._navigate_files_to(0)
 
     def action_open_latest(self) -> None:
         cluster = self._current_cluster()
@@ -478,7 +535,47 @@ class ClusterReviewApp(App[list[Cluster]]):
         if not photos:
             self.notify("No photos in cluster.", severity="warning")
             return
-        subprocess.Popen(["open", str(photos[-1].path)])
+        self._navigate_files_to(len(photos) - 1)
+
+    def action_open_file(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        files_table = self.query_one("#files-table", DataTable)
+        cur = files_table.cursor_row
+        photos = self._sorted_photos_by_time(cluster)
+        if not (0 <= cur < len(photos)):
+            return
+        subprocess.Popen(["open", str(photos[cur].path)])
+
+    def action_open_middle(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        photos = self._sorted_photos_by_time(cluster)
+        if not photos:
+            self.notify("No photos in cluster.", severity="warning")
+            return
+        self._navigate_files_to(len(photos) // 2)
+
+    def action_open_next_day(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        photos = self._sorted_photos_by_time(cluster)
+        if not photos:
+            self.notify("No photos in cluster.", severity="warning")
+            return
+        files_table = self.query_one("#files-table", DataTable)
+        cur = files_table.cursor_row
+        current_date = photos[cur].timestamp.date() if 0 <= cur < len(photos) and photos[cur].timestamp else None
+        target = len(photos) - 1
+        if current_date is not None:
+            for i, p in enumerate(photos):
+                if p.timestamp and p.timestamp.date() > current_date:
+                    target = i
+                    break
+        self._navigate_files_to(target)
 
     def action_explore_folder(self) -> None:
         cluster = self._current_cluster()

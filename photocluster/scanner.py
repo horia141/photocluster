@@ -7,13 +7,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import piexif
+from PIL import Image as _PilImage
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
 from .models import Photo
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".tiff", ".tif", ".heic", ".png", ".webp"}
 CACHE_FILENAME = ".photocluster_cache.db"
+CACHE_VERSION = "2"  # bump to invalidate stale entries after extraction changes
 
 
 def _init_cache(db_path: Path) -> sqlite3.Connection:
@@ -27,13 +28,27 @@ def _init_cache(db_path: Path) -> sqlite3.Connection:
             lon REAL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cache_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
     conn.commit()
+    row = conn.execute("SELECT value FROM cache_meta WHERE key = 'version'").fetchone()
+    if row is None or row[0] != CACHE_VERSION:
+        conn.execute("DELETE FROM scan_cache")
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('version', ?)",
+            (CACHE_VERSION,),
+        )
+        conn.commit()
     return conn
 
 
 def _gps_to_decimal(coords: tuple, ref: bytes | str) -> float:
-    d, m, s = coords
-    decimal = d[0] / d[1] + m[0] / (m[1] * 60) + s[0] / (s[1] * 3600)
+    d, m, s = (float(v) for v in coords)
+    decimal = d + m / 60 + s / 3600
     if ref in (b"S", b"W", "S", "W"):
         decimal = -decimal
     return decimal
@@ -58,33 +73,30 @@ def _extract_exif(path: Path) -> tuple[Optional[datetime], Optional[float], Opti
     lon: Optional[float] = None
 
     try:
-        exif_data = piexif.load(str(path))
+        img = _PilImage.open(path)
+        exif = img.getexif()
 
-        exif_ifd = exif_data.get("Exif", {})
-        dt_bytes = exif_ifd.get(piexif.ExifIFD.DateTimeOriginal)
-        if not dt_bytes:
-            ifd0 = exif_data.get("0th", {})
-            dt_bytes = ifd0.get(piexif.ImageIFD.DateTime)
-        if dt_bytes:
+        # DateTimeOriginal (0x9003) preferred over DateTime (0x0132)
+        dt_str = exif.get(0x9003) or exif.get(0x0132)
+        if dt_str:
             try:
-                timestamp = datetime.strptime(dt_bytes.decode(), "%Y:%m:%d %H:%M:%S")
-            except (ValueError, UnicodeDecodeError):
+                timestamp = datetime.strptime(str(dt_str), "%Y:%m:%d %H:%M:%S")
+            except ValueError:
                 pass
 
-        gps_ifd = exif_data.get("GPS", {})
+        gps_ifd = exif.get_ifd(0x8825)
         if gps_ifd:
-            lat_tag = gps_ifd.get(piexif.GPSIFD.GPSLatitude)
-            lat_ref = gps_ifd.get(piexif.GPSIFD.GPSLatitudeRef)
-            lon_tag = gps_ifd.get(piexif.GPSIFD.GPSLongitude)
-            lon_ref = gps_ifd.get(piexif.GPSIFD.GPSLongitudeRef)
-            if lat_tag and lat_ref and lon_tag and lon_ref:
+            lat_coords = gps_ifd.get(2)   # GPSLatitude
+            lat_ref    = gps_ifd.get(1)   # GPSLatitudeRef
+            lon_coords = gps_ifd.get(4)   # GPSLongitude
+            lon_ref    = gps_ifd.get(3)   # GPSLongitudeRef
+            if lat_coords and lat_ref and lon_coords and lon_ref:
                 try:
-                    lat = _gps_to_decimal(lat_tag, lat_ref)
-                    lon = _gps_to_decimal(lon_tag, lon_ref)
-                except (ZeroDivisionError, TypeError, IndexError):
+                    lat = _gps_to_decimal(lat_coords, lat_ref)
+                    lon = _gps_to_decimal(lon_coords, lon_ref)
+                except (ZeroDivisionError, TypeError, IndexError, ValueError):
                     pass
     except Exception:
-        # piexif can fail on non-JPEG or corrupt files; best-effort is fine
         pass
 
     return timestamp, lat, lon
