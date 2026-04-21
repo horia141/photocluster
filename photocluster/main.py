@@ -159,6 +159,59 @@ def main(
 
 
 # ---------------------------------------------------------------------------
+# Debug command
+# ---------------------------------------------------------------------------
+
+
+@app.command(name="debug-exif")
+def debug_exif(
+    file: Path = typer.Argument(..., help="Image file to inspect."),
+) -> None:
+    """Print raw EXIF and GPS data extracted from a single image file."""
+    from PIL import Image as _PilImage
+
+    if not file.is_file():
+        console.print(f"[red]Error:[/red] File not found: {file}")
+        raise typer.Exit(1)
+
+    try:
+        img = _PilImage.open(file)
+        exif = img.getexif()
+    except Exception as exc:
+        console.print(f"[red]Failed to open/read EXIF:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold]File:[/bold] {file}")
+    console.print(f"[bold]Format:[/bold] {img.format}  [bold]Mode:[/bold] {img.mode}  [bold]Size:[/bold] {img.size}")
+
+    dt_orig = exif.get(0x9003)
+    dt_mod  = exif.get(0x0132)
+    console.print(f"\n[bold]DateTimeOriginal (0x9003):[/bold] {dt_orig!r}")
+    console.print(f"[bold]DateTime         (0x0132):[/bold] {dt_mod!r}")
+
+    gps_ifd = exif.get_ifd(0x8825)
+    console.print(f"\n[bold]GPS IFD (0x8825):[/bold] {dict(gps_ifd) if gps_ifd else 'empty / not found'}")
+
+    if gps_ifd:
+        lat_coords = gps_ifd.get(2)
+        lat_ref    = gps_ifd.get(1)
+        lon_coords = gps_ifd.get(4)
+        lon_ref    = gps_ifd.get(3)
+        console.print(f"  LatitudeRef={lat_ref!r}  Latitude={lat_coords!r}")
+        console.print(f"  LongitudeRef={lon_ref!r}  Longitude={lon_coords!r}")
+        if lat_coords and lat_ref and lon_coords and lon_ref:
+            try:
+                from .scanner import _gps_to_decimal
+                lat = _gps_to_decimal(lat_coords, lat_ref)
+                lon = _gps_to_decimal(lon_coords, lon_ref)
+                console.print(f"\n[green]Parsed:[/green] lat={lat:.6f}  lon={lon:.6f}")
+            except Exception as exc:
+                console.print(f"\n[red]Parse failed:[/red] {exc}")
+        else:
+            console.print("\n[yellow]Incomplete GPS tags — cannot parse coordinates.[/yellow]")
+
+
+# ---------------------------------------------------------------------------
 # Undo command
 # ---------------------------------------------------------------------------
 

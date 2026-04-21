@@ -14,7 +14,7 @@ from .models import Photo
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".tiff", ".tif", ".heic", ".png", ".webp"}
 CACHE_FILENAME = ".photocluster_cache.db"
-CACHE_VERSION = "2"  # bump to invalidate stale entries after extraction changes
+CACHE_VERSION = "3"  # bump to invalidate stale entries after extraction changes
 
 
 def _init_cache(db_path: Path) -> sqlite3.Connection:

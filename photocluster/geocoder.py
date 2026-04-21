@@ -5,7 +5,7 @@ from typing import Optional
 
 from geopy.exc import GeocoderServiceError, GeocoderTimedOut
 from geopy.geocoders import Nominatim
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeRemainingColumn
 
 from .models import Cluster
 
@@ -44,16 +44,22 @@ def name_clusters(clusters: list[Cluster]) -> None:
 
     with Progress(
         SpinnerColumn(),
-        TextColumn("[bold blue]Reverse geocoding cluster centroids..."),
+        TextColumn("[bold blue]Geocoding..."),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("[dim]{task.fields[current]}"),
+        TimeRemainingColumn(),
         transient=True,
     ) as progress:
-        progress.add_task("geocode", total=len(to_geocode))
+        task = progress.add_task("geocode", total=len(to_geocode), current="")
 
         for cluster in to_geocode:
             start, _ = cluster.date_range
             date_prefix = start.strftime("%Y.%m.%d") if start else "YYYY.MM.DD"
+            progress.update(task, current=date_prefix)
             city = _reverse_geocode(cluster.centroid_lat, cluster.centroid_lon)  # type: ignore[arg-type]
             cluster.name = f"{date_prefix} \u2013 {city}" if city else f"{date_prefix} \u2013 Untitled"
+            progress.advance(task)
 
     # Handle clusters with no GPS
     for cluster in clusters:
