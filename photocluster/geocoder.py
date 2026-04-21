@@ -45,9 +45,49 @@ def _reverse_geocode(lat: float, lon: float) -> Optional[str]:
         return None
 
 
+def geocode_one(lat: float, lon: float, cache_db: Optional[Path] = None) -> Optional[str]:
+    """Return a city name for the given coordinates, using cache when available."""
+    conn: Optional[sqlite3.Connection] = None
+    if cache_db is not None:
+        try:
+            conn = sqlite3.connect(cache_db)
+        except Exception:
+            pass
+
+    clat, clon = _cache_key(lat, lon)
+
+    if conn is not None:
+        try:
+            row = conn.execute(
+                "SELECT name FROM geocode_cache WHERE lat = ? AND lon = ?", (clat, clon)
+            ).fetchone()
+            if row is not None:
+                conn.close()
+                return row[0]
+        except Exception:
+            pass
+
+    name = _reverse_geocode(lat, lon)
+
+    if conn is not None:
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO geocode_cache (lat, lon, name) VALUES (?, ?, ?)",
+                (clat, clon, name),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        conn.close()
+
+    return name
+
+
 def name_clusters(clusters: list[Cluster], cache_db: Optional[Path] = None) -> None:
-    """Assign proposed names to unlocked unnamed clusters (in-place)."""
-    to_geocode = [c for c in clusters if not c.locked and not c.name and c.centroid_lat is not None]
+    """Geocode all cluster centroids into the cache; assign names to unlocked unnamed clusters."""
+    # All clusters with GPS — locked ones are geocoded purely for cache population so the TUI
+    # can display per-photo locations. Unlocked unnamed ones also get their name assigned.
+    to_geocode = [c for c in clusters if c.centroid_lat is not None]
 
     conn: Optional[sqlite3.Connection] = None
     if cache_db is not None:
@@ -60,7 +100,17 @@ def name_clusters(clusters: list[Cluster], cache_db: Optional[Path] = None) -> N
         row = conn.execute(
             "SELECT name FROM geocode_cache WHERE lat = ? AND lon = ?", (clat, clon)
         ).fetchone()
-        return row[0] if row is not None else None
+        # None means no row; row[0] may itself be None (previous failed lookup)
+        return row[0] if (row is not None and row[0] is not None) else None
+
+    def _cached(lat: float, lon: float) -> bool:
+        """Return True if there is any row in the cache (even a null-name one) — i.e. no fetch needed."""
+        if conn is None:
+            return False
+        clat, clon = _cache_key(lat, lon)
+        return conn.execute(
+            "SELECT 1 FROM geocode_cache WHERE lat = ? AND lon = ?", (clat, clon)
+        ).fetchone() is not None
 
     def _store(lat: float, lon: float, name: Optional[str]) -> None:
         if conn is None:
@@ -72,9 +122,10 @@ def name_clusters(clusters: list[Cluster], cache_db: Optional[Path] = None) -> N
         )
         conn.commit()
 
-    # Split into cache hits and actual network requests
-    cache_hits = sum(1 for c in to_geocode if _lookup(c.centroid_lat, c.centroid_lon) is not None)  # type: ignore[arg-type]
-    need_fetch = len(to_geocode) - cache_hits
+    need_fetch = sum(
+        1 for c in to_geocode
+        if not _cached(c.centroid_lat, c.centroid_lon)  # type: ignore[arg-type]
+    )
 
     with Progress(
         SpinnerColumn(),
@@ -85,26 +136,30 @@ def name_clusters(clusters: list[Cluster], cache_db: Optional[Path] = None) -> N
         TimeRemainingColumn(),
         transient=True,
     ) as progress:
-        task = progress.add_task("geocode", total=len(to_geocode), current="")
+        task = progress.add_task("geocode", total=max(need_fetch, 1), current="")
 
         for cluster in to_geocode:
-            start, _ = cluster.date_range
-            date_prefix = start.strftime("%Y.%m.%d") if start else "YYYY.MM.DD"
-            progress.update(task, current=date_prefix)
-
             lat, lon = cluster.centroid_lat, cluster.centroid_lon  # type: ignore[assignment]
+
             city = _lookup(lat, lon)
-            if city is None:
+            if not _cached(lat, lon):
+                start, _ = cluster.date_range
+                date_prefix = start.strftime("%Y.%m.%d") if start else "YYYY.MM.DD"
+                progress.update(task, current=date_prefix)
                 city = _reverse_geocode(lat, lon)
                 _store(lat, lon, city)
+                progress.advance(task)
 
-            cluster.name = f"{date_prefix} \u2013 {city}" if city else f"{date_prefix} \u2013 Untitled"
-            progress.advance(task)
+            # Only assign a name to unlocked clusters that don't have one yet
+            if not cluster.locked and not cluster.name:
+                start, _ = cluster.date_range
+                date_prefix = start.strftime("%Y.%m.%d") if start else "YYYY.MM.DD"
+                cluster.name = f"{date_prefix} \u2013 {city}" if city else f"{date_prefix} \u2013 Untitled"
 
     if conn is not None:
         conn.close()
 
-    # Handle clusters with no GPS
+    # Unlocked clusters with no GPS get a plain date name
     for cluster in clusters:
         if not cluster.locked and not cluster.name:
             start, _ = cluster.date_range

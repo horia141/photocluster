@@ -129,6 +129,7 @@ def main(
         clusters=clusters,
         mode=mode,
         output=str(effective_output),
+        cache_db=cache_db_path(source),
     )
     result = tui_app.run()
 

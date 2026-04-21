@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 from datetime import datetime
+from pathlib import Path
 from typing import Literal, Optional
 
 from rich.text import Text
@@ -10,7 +12,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static
+from textual.widgets import Button, DataTable, Header, Input, Label, Static
 
 try:
     from PIL import Image as PilImage, ImageOps
@@ -92,14 +94,15 @@ class MergeDialog(ModalScreen[Optional[int]]):
     #buttons Button { margin-right: 1; }
     """
 
-    def __init__(self, clusters: list[Cluster], exclude_id: int) -> None:
+    def __init__(self, clusters: list[Cluster], exclude_id: int, label: str = "Merge into which cluster?") -> None:
         super().__init__()
         self._clusters = [c for c in clusters if c.id != exclude_id and c.action != "skip"]
         self._selected_id: Optional[int] = self._clusters[0].id if self._clusters else None
+        self._label = label
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("Merge into which cluster?")
+            yield Label(self._label)
             table: DataTable = DataTable(id="merge-table", cursor_type="row")
             yield table
             with Horizontal(id="buttons"):
@@ -127,56 +130,6 @@ class MergeDialog(ModalScreen[Optional[int]]):
         self.dismiss(None)
 
 
-class SplitDialog(ModalScreen[Optional[datetime]]):
-    """Ask for a split date (YYYY-MM-DD)."""
-
-    DEFAULT_CSS = """
-    SplitDialog {
-        align: center middle;
-    }
-    #dialog {
-        width: 50;
-        height: auto;
-        border: thick $primary;
-        background: $surface;
-        padding: 1 2;
-    }
-    #dialog Label { margin-bottom: 1; }
-    #dialog Input { margin-bottom: 1; }
-    #error { color: $error; height: 1; margin-bottom: 1; }
-    #buttons Button { margin-right: 1; }
-    """
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
-            yield Label("Split at date (YYYY-MM-DD).\nPhotos from this date onwards go to new cluster.")
-            yield Input(placeholder="e.g. 2024-07-16", id="date-input")
-            yield Label("", id="error")
-            with Horizontal(id="buttons"):
-                yield Button("OK", id="ok", variant="primary")
-                yield Button("Cancel", id="cancel")
-
-    @on(Button.Pressed, "#ok")
-    def _ok(self) -> None:
-        self._try_submit()
-
-    @on(Input.Submitted)
-    def _submitted(self, _: Input.Submitted) -> None:
-        self._try_submit()
-
-    def _try_submit(self) -> None:
-        raw = self.query_one("#date-input", Input).value.strip()
-        try:
-            dt = datetime.strptime(raw, "%Y-%m-%d")
-            self.dismiss(dt)
-        except ValueError:
-            self.query_one("#error", Label).update(f"Invalid date: '{raw}'")
-
-    @on(Button.Pressed, "#cancel")
-    def _cancel(self) -> None:
-        self.dismiss(None)
-
-
 # ---------------------------------------------------------------------------
 # Main review app
 # ---------------------------------------------------------------------------
@@ -188,21 +141,25 @@ class ClusterReviewApp(App[list[Cluster]]):
     TITLE = "photocluster"
 
     BINDINGS = [
-        Binding("left", "focus_left", "", show=False, priority=True),
-        Binding("right", "focus_right", "", show=False, priority=True),
-        Binding("r", "rename", "Rename"),
-        Binding("k", "toggle_skip", "Skip/Accept"),
-        Binding("m", "merge", "Merge"),
-        Binding("s", "split", "Split"),
-        Binding("e", "open_earliest", "Earliest"),
-        Binding("b", "open_middle", "Bisect"),
-        Binding("l", "open_latest", "Latest"),
-        Binding("n", "open_next_day", "Next day"),
-        Binding("o", "open_file", "Open"),
-        Binding("f", "explore_folder", "Folder"),
-        Binding("g", "go", "Go (apply)"),
-        Binding("enter", "go", "Go (apply)", show=False),
-        Binding("q", "quit_app", "Quit"),
+        Binding("left",  "focus_left",      "", show=False, priority=True),
+        Binding("right", "focus_right",     "", show=False, priority=True),
+        Binding("r",     "rename",          "", show=False),
+        Binding("k",     "toggle_skip",     "", show=False),
+        Binding("m",     "merge",           "", show=False),
+        Binding("e",     "open_earliest",   "", show=False),
+        Binding("b",     "open_middle",     "", show=False),
+        Binding("l",     "open_latest",     "", show=False),
+        Binding("n",     "open_next_day",   "", show=False),
+        Binding("o",     "open_file",       "", show=False),
+        Binding("f",     "explore_folder",  "", show=False),
+        Binding("s",     "select_toggle",   "", show=False),
+        Binding("d",     "select_range",    "", show=False),
+        Binding("c",     "select_cancel",   "", show=False),
+        Binding("x",     "select_extract",  "", show=False),
+        Binding("a",     "select_move",     "", show=False),
+        Binding("g",     "go",              "", show=False),
+        Binding("enter", "go",              "", show=False),
+        Binding("q",     "quit_app",        "", show=False),
     ]
 
     DEFAULT_CSS = """
@@ -212,6 +169,9 @@ class ClusterReviewApp(App[list[Cluster]]):
         color: $text;
         padding: 1 2;
         border-bottom: solid $primary;
+    }
+    #body {
+        height: 1fr;
     }
     #main-layout {
         height: 1fr;
@@ -244,6 +204,12 @@ class ClusterReviewApp(App[list[Cluster]]):
         content-align: center middle;
         color: $text-disabled;
     }
+    #custom-footer {
+        height: 1;
+        background: $primary-darken-2;
+        color: $text;
+        padding: 0 1;
+    }
     """
 
     def __init__(
@@ -251,11 +217,14 @@ class ClusterReviewApp(App[list[Cluster]]):
         clusters: list[Cluster],
         mode: str,
         output: str,
+        cache_db: Optional["Path"] = None,
     ) -> None:
         super().__init__()
         self._clusters = list(clusters)
         self._mode = mode
         self._output = output
+        self._selection: set[str] = set()
+        self._cache_db = cache_db
 
     # ------------------------------------------------------------------
     # Compose
@@ -263,35 +232,44 @@ class ClusterReviewApp(App[list[Cluster]]):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static(
-            f"  Mode: [bold]{self._mode}[/bold]   "
-            f"Destination: [bold]{self._output}[/bold]   "
-            f"  [dim]r[/dim]:Rename  [dim]k[/dim]:Skip  [dim]m[/dim]:Merge  [dim]s[/dim]:Split  "
-            f"[dim]e[/dim]:Earliest  [dim]l[/dim]:Latest  [dim]f[/dim]:Folder  "
-            f"[dim]g/Enter[/dim]:Apply  [dim]q[/dim]:Quit",
-            id="info-bar",
-            markup=True,
-        )
-        with Horizontal(id="main-layout"):
-            yield DataTable(id="cluster-table", cursor_type="row")
-            yield DataTable(id="files-table", cursor_type="row")
-            with Vertical(id="preview-pane"):
-                yield Label("", id="preview-label")
-                if _HAS_IMAGE:
-                    yield ImageWidget(id="preview-image")
-                else:
-                    yield Static(
-                        "pip install textual-image\nfor inline previews",
-                        id="preview-placeholder",
-                    )
-        yield Footer()
+        with Vertical(id="body"):
+            yield Static(
+                f"  Mode: [bold]{self._mode}[/bold]   Output: [bold]{self._output}[/bold]",
+                id="info-bar",
+                markup=True,
+            )
+            with Horizontal(id="main-layout"):
+                yield DataTable(id="cluster-table", cursor_type="row")
+                yield DataTable(id="files-table", cursor_type="row")
+                with Vertical(id="preview-pane"):
+                    yield Label("", id="preview-label")
+                    if _HAS_IMAGE:
+                        yield ImageWidget(id="preview-image")
+                    else:
+                        yield Static(
+                            "pip install textual-image\nfor inline previews",
+                            id="preview-placeholder",
+                        )
+            yield Static(
+                "  r:Rename  k:Skip  m:Merge"
+                "  |  "
+                "e:Earliest  b:Bisect  l:Latest  n:Next day"
+                "  |  "
+                "s:Select  d:Range  c:Deselect  x:Extract  a:Move"
+                "  |  "
+                "o:Open  f:Folder"
+                "  |  "
+                "g:Apply  q:Quit",
+                id="custom-footer",
+            )
 
     def on_mount(self) -> None:
         files_table = self.query_one("#files-table", DataTable)
+        files_table.add_column("", key="sel", width=2)
         files_table.add_column("#", key="idx", width=5)
         files_table.add_column("File", key="name")
         files_table.add_column("Time", key="time", width=14)
-        files_table.add_column("GPS", key="gps", width=10)
+        files_table.add_column("Location", key="gps", width=20)
         self._build_table()
         cluster = self._current_cluster()
         if cluster is not None:
@@ -301,7 +279,13 @@ class ClusterReviewApp(App[list[Cluster]]):
     # Table helpers
     # ------------------------------------------------------------------
 
+    def _sort_clusters(self) -> None:
+        self._clusters.sort(
+            key=lambda c: (c.date_range[0] is None, c.date_range[0] or datetime.min)
+        )
+
     def _build_table(self) -> None:
+        self._sort_clusters()
         table = self.query_one("#cluster-table", DataTable)
         table.clear(columns=True)
         table.add_column("#", key="id", width=5)
@@ -360,6 +344,7 @@ class ClusterReviewApp(App[list[Cluster]]):
             return
         cluster = self._cluster_by_id(int(str(event.row_key.value)))
         if cluster is not None:
+            self._selection.clear()
             self._populate_files_table(cluster)
 
     @on(DataTable.RowHighlighted, "#files-table")
@@ -374,16 +359,50 @@ class ClusterReviewApp(App[list[Cluster]]):
         if photo is not None:
             self._update_preview(photo)
 
+    def _sel_marker(self, path_str: str) -> Text:
+        return Text("★", style="bold yellow") if path_str in self._selection else Text(" ")
+
+    def _lookup_city(self, lat: float, lon: float) -> Optional[str]:
+        if self._cache_db is None or not self._cache_db.exists():
+            return None
+        try:
+            clat, clon = round(lat, 3), round(lon, 3)
+            conn = sqlite3.connect(self._cache_db)
+            row = conn.execute(
+                "SELECT name FROM geocode_cache WHERE lat = ? AND lon = ?", (clat, clon)
+            ).fetchone()
+            conn.close()
+            return row[0] if row and row[0] else None
+        except Exception:
+            return None
+
     def _populate_files_table(self, cluster: Cluster) -> None:
         table = self.query_one("#files-table", DataTable)
         table.clear()
         photos = self._sorted_photos_by_time(cluster)
+
+        cluster_city: Optional[str] = None
+        if cluster.centroid_lat is not None:
+            cluster_city = self._lookup_city(cluster.centroid_lat, cluster.centroid_lon)  # type: ignore[arg-type]
+
         for i, photo in enumerate(photos):
             ts = photo.timestamp.strftime("%Y-%m-%d %H:%M") if photo.timestamp else "–"
-            gps = Text("no GPS", style="red") if not photo.has_gps else Text("ok", style="dim green")
-            table.add_row(str(i + 1), photo.path.name, ts, gps, key=str(photo.path))
+            if cluster_city:
+                loc: Text = Text(cluster_city, style="dim green")
+            elif cluster.centroid_lat is not None:
+                loc = Text("–", style="dim")
+            else:
+                loc = Text("no GPS", style="red")
+            table.add_row(self._sel_marker(str(photo.path)), str(i + 1), photo.path.name, ts, loc, key=str(photo.path))
         if photos:
             self._update_preview(photos[0])
+
+    def _refresh_file_row(self, path_str: str) -> None:
+        table = self.query_one("#files-table", DataTable)
+        try:
+            table.update_cell(path_str, "sel", self._sel_marker(path_str))
+        except Exception:
+            pass
 
     @work(exclusive=True, thread=True)
     def _update_preview(self, photo: Photo) -> None:
@@ -463,54 +482,125 @@ class ClusterReviewApp(App[list[Cluster]]):
 
         self.push_screen(MergeDialog(self._clusters, exclude_id=cluster.id), _apply)
 
-    def action_split(self) -> None:
-        cluster = self._current_cluster()
-        if cluster is None:
-            return
-        if cluster.locked:
-            self.notify("Locked clusters cannot be split here.", severity="warning")
-            return
-
-        def _apply(split_date: Optional[datetime]) -> None:
-            if split_date is None:
-                return
-            before = [p for p in cluster.photos if p.timestamp is None or p.timestamp < split_date]
-            after = [p for p in cluster.photos if p.timestamp is not None and p.timestamp >= split_date]
-            if not before or not after:
-                self.notify("Split date produces an empty half — choose a different date.", severity="warning")
-                return
-
-            # Shorten the original cluster to 'before' photos
-            cluster.photos = before
-            cluster.name = cluster.name  # unchanged
-
-            # Create the new cluster
-            new_id = max(c.id for c in self._clusters) + 1
-            from .clusterer import _centroid
-            clat, clon = _centroid(after)
-            start, _ = min(
-                ((p.timestamp, p) for p in after if p.timestamp), default=(None, None)
-            )
-            date_prefix = start.strftime("%Y.%m.%d") if start else "YYYY.MM.DD"
-            new_cluster = Cluster(
-                id=new_id,
-                name=f"{date_prefix} \u2013 Untitled",
-                photos=after,
-                centroid_lat=clat,
-                centroid_lon=clon,
-                locked=False,
-                action="accept",
-            )
-            self._clusters.append(new_cluster)
-            self._build_table()
-            self.notify(f"Split into {len(before)} + {len(after)} photos.")
-
-        self.push_screen(SplitDialog(), _apply)
-
     def _sorted_photos_by_time(self, cluster: Cluster) -> list[Photo]:
         with_ts = [p for p in cluster.photos if p.timestamp is not None]
         without_ts = [p for p in cluster.photos if p.timestamp is None]
         return sorted(with_ts, key=lambda p: p.timestamp) + without_ts  # type: ignore[arg-type]
+
+    def _make_cluster_from(self, photos: list[Photo]) -> Cluster:
+        from .clusterer import _centroid
+        clat, clon = _centroid(photos)
+        start = min((p.timestamp for p in photos if p.timestamp), default=None)
+        date_prefix = start.strftime("%Y.%m.%d") if start else "YYYY.MM.DD"
+        new_id = max(c.id for c in self._clusters) + 1
+        return Cluster(
+            id=new_id,
+            name=f"{date_prefix} \u2013 Untitled",
+            photos=photos,
+            centroid_lat=clat,
+            centroid_lon=clon,
+            locked=False,
+            action="accept",
+        )
+
+    # ------------------------------------------------------------------
+    # Selection actions
+    # ------------------------------------------------------------------
+
+    def action_select_toggle(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        photos = self._sorted_photos_by_time(cluster)
+        cur = self.query_one("#files-table", DataTable).cursor_row
+        if not (0 <= cur < len(photos)):
+            return
+        path_str = str(photos[cur].path)
+        if path_str in self._selection:
+            self._selection.discard(path_str)
+        else:
+            self._selection.add(path_str)
+        self._refresh_file_row(path_str)
+
+    def action_select_range(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        photos = self._sorted_photos_by_time(cluster)
+        cur = self.query_one("#files-table", DataTable).cursor_row
+        if not (0 <= cur < len(photos)):
+            return
+        if not self._selection:
+            self.action_select_toggle()
+            return
+        selected_indices = [i for i, p in enumerate(photos) if str(p.path) in self._selection]
+        closest = min(selected_indices, key=lambda i: abs(i - cur))
+        lo, hi = sorted([cur, closest])
+        for i in range(lo, hi + 1):
+            path_str = str(photos[i].path)
+            self._selection.add(path_str)
+            self._refresh_file_row(path_str)
+
+    def action_select_cancel(self) -> None:
+        old = set(self._selection)
+        self._selection.clear()
+        for path_str in old:
+            self._refresh_file_row(path_str)
+
+    def action_select_extract(self) -> None:
+        cluster = self._current_cluster()
+        if not cluster or not self._selection:
+            self.notify("Nothing selected.", severity="warning")
+            return
+        selected = [p for p in cluster.photos if str(p.path) in self._selection]
+        remaining = [p for p in cluster.photos if str(p.path) not in self._selection]
+        if not remaining:
+            self.notify("Cannot extract — would leave the cluster empty.", severity="warning")
+            return
+        new_cluster = self._make_cluster_from(selected)
+
+        def _apply(new_name: Optional[str]) -> None:
+            if new_name is None:
+                return
+            new_cluster.name = new_name
+            cluster.photos = remaining
+            self._clusters.append(new_cluster)
+            self._selection.clear()
+            self._build_table()
+            self._populate_files_table(cluster)
+            self.notify(f"Extracted {len(selected)} photo(s) into new cluster #{new_cluster.id}.")
+
+        self.push_screen(RenameDialog(new_cluster.name), _apply)
+
+    def action_select_move(self) -> None:
+        cluster = self._current_cluster()
+        if not cluster or not self._selection:
+            self.notify("Nothing selected.", severity="warning")
+            return
+        selected = [p for p in cluster.photos if str(p.path) in self._selection]
+        remaining = [p for p in cluster.photos if str(p.path) not in self._selection]
+        if not remaining:
+            self.notify("Cannot move — would leave the cluster empty. Use merge instead.", severity="warning")
+            return
+        if len([c for c in self._clusters if c.id != cluster.id]) == 0:
+            self.notify("No other clusters to move photos into.", severity="warning")
+            return
+
+        def _apply(target_id: Optional[int]) -> None:
+            if target_id is None:
+                return
+            target = self._cluster_by_id(target_id)
+            if target is None:
+                return
+            cluster.photos = remaining
+            target.photos.extend(selected)
+            self._selection.clear()
+            self._refresh_row(cluster)
+            self._refresh_row(target)
+            self._populate_files_table(cluster)
+            self.notify(f"Moved {len(selected)} photo(s) to '{target.name[:30]}'.")
+
+        self.push_screen(MergeDialog(self._clusters, exclude_id=cluster.id, label="Move selection to which cluster?"), _apply)
 
     def _navigate_files_to(self, index: int) -> None:
         table = self.query_one("#files-table", DataTable)
