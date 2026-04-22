@@ -21,7 +21,7 @@ try:
 except ImportError:
     _HAS_IMAGE = False
 
-_PREVIEW_WIDTH_PX = 900
+_PREVIEW_WIDTH_PX = 1800
 
 from .models import Cluster, Photo
 
