@@ -159,6 +159,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         Binding("a",     "select_move",     "", show=False),
         Binding("y",     "yank",            "", show=False),
         Binding(";",     "send_to_random",  "", show=False),
+        Binding("ctrl+s","save_draft",      "", show=False),
         Binding("g",     "go",              "", show=False),
         Binding("enter", "go",              "", show=False),
         Binding("q",     "quit_app",        "", show=False),
@@ -220,6 +221,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         mode: str,
         output: str,
         cache_db: Optional["Path"] = None,
+        draft_path: Optional["Path"] = None,
     ) -> None:
         super().__init__()
         self._clusters = list(clusters)
@@ -227,6 +229,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         self._output = output
         self._selection: set[str] = set()
         self._cache_db = cache_db
+        self._draft_path = draft_path
 
     # ------------------------------------------------------------------
     # Compose
@@ -261,7 +264,7 @@ class ClusterReviewApp(App[list[Cluster]]):
                 "  |  "
                 "o:Open  f:Folder"
                 "  |  "
-                "g:Apply  q:Quit",
+                "ctrl+s:Save draft  g:Apply  q:Quit",
                 id="custom-footer",
             )
 
@@ -290,9 +293,16 @@ class ClusterReviewApp(App[list[Cluster]]):
             )
         )
 
-    def _build_table(self) -> None:
-        self._sort_clusters()
+    def _build_table(self, select_cluster_id: Optional[int] = None) -> None:
         table = self.query_one("#cluster-table", DataTable)
+
+        # Preserve the current cluster across rebuilds unless a specific one is requested
+        if select_cluster_id is None:
+            current = self._current_cluster()
+            if current is not None:
+                select_cluster_id = current.id
+
+        self._sort_clusters()
         table.clear(columns=True)
         table.add_column("#", key="id", width=5)
         table.add_column("Name", key="name")
@@ -302,6 +312,12 @@ class ClusterReviewApp(App[list[Cluster]]):
         table.add_column("Type", key="type", width=8)
         for c in self._clusters:
             table.add_row(*self._row_cells(c), key=str(c.id))
+
+        if select_cluster_id is not None:
+            for i, c in enumerate(self._clusters):
+                if c.id == select_cluster_id:
+                    table.move_cursor(row=i)
+                    break
 
     def _row_cells(self, c: Cluster) -> tuple:
         start, end = c.date_range
@@ -325,6 +341,17 @@ class ClusterReviewApp(App[list[Cluster]]):
             label = target.name[:14] + "…" if target and len(target.name) > 14 else (target.name if target else "?")
             return Text(f"Merge→ {label}", style="cyan")
         return Text("Accept", style="bold green")
+
+    def _adjacent_cluster_id(self, cid: int) -> Optional[int]:
+        """Return the ID of the cluster just before cid (or just after if it's first)."""
+        ids = [c.id for c in self._clusters]
+        try:
+            idx = ids.index(cid)
+        except ValueError:
+            return ids[0] if ids else None
+        if idx > 0:
+            return ids[idx - 1]
+        return ids[idx + 1] if len(ids) > 1 else None
 
     def _cluster_by_id(self, cid: int) -> Optional[Cluster]:
         return next((c for c in self._clusters if c.id == cid), None)
@@ -382,7 +409,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         except Exception:
             return None
 
-    def _populate_files_table(self, cluster: Cluster) -> None:
+    def _populate_files_table(self, cluster: Cluster, cursor_row: int = 0) -> None:
         table = self.query_one("#files-table", DataTable)
         table.clear()
         photos = self._sorted_photos_by_time(cluster)
@@ -400,8 +427,12 @@ class ClusterReviewApp(App[list[Cluster]]):
             else:
                 loc = Text("no GPS", style="red")
             table.add_row(self._sel_marker(str(photo.path)), str(i + 1), photo.path.name, ts, loc, key=str(photo.path))
+
         if photos:
-            self._update_preview(photos[0])
+            row = min(cursor_row, len(photos) - 1)
+            if row > 0:
+                table.move_cursor(row=row)
+            self._update_preview(photos[row])
 
     def _refresh_file_row(self, path_str: str) -> None:
         table = self.query_one("#files-table", DataTable)
@@ -564,6 +595,7 @@ class ClusterReviewApp(App[list[Cluster]]):
             self.notify("Cannot extract — would leave the cluster empty.", severity="warning")
             return
         new_cluster = self._make_cluster_from(selected)
+        saved_cursor = self.query_one("#files-table", DataTable).cursor_row
 
         def _apply(new_name: Optional[str]) -> None:
             if new_name is None:
@@ -573,7 +605,7 @@ class ClusterReviewApp(App[list[Cluster]]):
             self._clusters.append(new_cluster)
             self._selection.clear()
             self._build_table()
-            self._populate_files_table(cluster)
+            self._populate_files_table(cluster, cursor_row=saved_cursor)
             self.notify(f"Extracted {len(selected)} photo(s) into new cluster #{new_cluster.id}.")
 
         self.push_screen(RenameDialog(new_cluster.name), _apply)
@@ -592,6 +624,8 @@ class ClusterReviewApp(App[list[Cluster]]):
             self.notify("No other clusters to move photos into.", severity="warning")
             return
 
+        saved_cursor = self.query_one("#files-table", DataTable).cursor_row
+
         def _apply(target_id: Optional[int]) -> None:
             if target_id is None:
                 return
@@ -603,7 +637,7 @@ class ClusterReviewApp(App[list[Cluster]]):
             self._selection.clear()
             self._refresh_row(cluster)
             self._refresh_row(target)
-            self._populate_files_table(cluster)
+            self._populate_files_table(cluster, cursor_row=saved_cursor)
             self.notify(f"Moved {len(selected)} photo(s) to '{target.name[:30]}'.")
 
         self.push_screen(MergeDialog(self._clusters, exclude_id=cluster.id, label="Move selection to which cluster?"), _apply)
@@ -613,32 +647,32 @@ class ClusterReviewApp(App[list[Cluster]]):
         if cluster is None:
             return
 
+        files_table = self.query_one("#files-table", DataTable)
+        saved_cursor = files_table.cursor_row
+
         if self._selection:
             to_remove = self._selection.copy()
             self._selection.clear()
         else:
             photos = self._sorted_photos_by_time(cluster)
-            cur = self.query_one("#files-table", DataTable).cursor_row
-            if not (0 <= cur < len(photos)):
+            if not (0 <= saved_cursor < len(photos)):
                 return
-            to_remove = {str(photos[cur].path)}
+            to_remove = {str(photos[saved_cursor].path)}
 
         cluster.photos = [p for p in cluster.photos if str(p.path) not in to_remove]
         count = len(to_remove)
 
         if not cluster.photos:
-            cluster_table = self.query_one("#cluster-table", DataTable)
-            cur_row = cluster_table.cursor_row
+            focus_id = self._adjacent_cluster_id(cluster.id)
             self._clusters = [c for c in self._clusters if c.id != cluster.id]
-            self._build_table()
-            cluster_table.move_cursor(row=max(0, cur_row - 1))
+            self._build_table(select_cluster_id=focus_id)
             new_cluster = self._current_cluster()
             if new_cluster:
                 self._populate_files_table(new_cluster)
             self.notify(f"Yanked {count} photo(s); cluster was empty and removed.")
         else:
             self._refresh_row(cluster)
-            self._populate_files_table(cluster)
+            self._populate_files_table(cluster, cursor_row=saved_cursor)
             self.notify(f"Yanked {count} photo(s) from cluster.")
 
     def _get_or_create_random_cluster(self) -> Cluster:
@@ -664,15 +698,17 @@ class ClusterReviewApp(App[list[Cluster]]):
             self.notify("Already in Random.", severity="warning")
             return
 
+        files_table = self.query_one("#files-table", DataTable)
+        saved_cursor = files_table.cursor_row
+
         if self._selection:
             to_move = {str(p.path) for p in cluster.photos if str(p.path) in self._selection}
             self._selection.clear()
         else:
             photos = self._sorted_photos_by_time(cluster)
-            cur = self.query_one("#files-table", DataTable).cursor_row
-            if not (0 <= cur < len(photos)):
+            if not (0 <= saved_cursor < len(photos)):
                 return
-            to_move = {str(photos[cur].path)}
+            to_move = {str(photos[saved_cursor].path)}
 
         moving = [p for p in cluster.photos if str(p.path) in to_move]
         cluster.photos = [p for p in cluster.photos if str(p.path) not in to_move]
@@ -681,17 +717,15 @@ class ClusterReviewApp(App[list[Cluster]]):
         random_cluster.photos.extend(moving)
 
         if not cluster.photos:
-            cluster_table = self.query_one("#cluster-table", DataTable)
-            cur_row = cluster_table.cursor_row
+            focus_id = self._adjacent_cluster_id(cluster.id)
             self._clusters = [c for c in self._clusters if c.id != cluster.id]
-            self._build_table()
-            cluster_table.move_cursor(row=max(0, cur_row - 1))
+            self._build_table(select_cluster_id=focus_id)
             new_cluster = self._current_cluster()
             if new_cluster:
                 self._populate_files_table(new_cluster)
         else:
             self._build_table()
-            self._populate_files_table(cluster)
+            self._populate_files_table(cluster, cursor_row=saved_cursor)
 
         self.notify(f"Moved {len(moving)} photo(s) to Random.")
 
@@ -769,6 +803,14 @@ class ClusterReviewApp(App[list[Cluster]]):
             return
         folder = cluster.photos[0].path.parent
         subprocess.Popen(["open", str(folder)])
+
+    def action_save_draft(self) -> None:
+        if self._draft_path is None:
+            self.notify("No draft path configured.", severity="warning")
+            return
+        from .draft import save_draft
+        save_draft(self._clusters, self._draft_path)
+        self.notify(f"Draft saved to {self._draft_path.name}")
 
     def action_go(self) -> None:
         self._resolve_merges()

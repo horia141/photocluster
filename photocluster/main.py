@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .clusterer import cluster_photos, parse_time_gap
+from .draft import draft_path, load_draft, save_draft
 from .executor import FileMode, apply_plan, undo_last_run
 from .geocoder import name_clusters
 from .scanner import cache_db_path, scan
@@ -90,6 +91,15 @@ def main(
 
     name_clusters(clusters, cache_db=cache_db_path(source))
 
+    # --- Resume from draft ---------------------------------------------------
+    dp = draft_path(source)
+    if dp.exists():
+        clusters, n_matched, n_missing = load_draft(clusters, photos, dp)
+        msg = f"[bold yellow]Resuming from draft[/bold yellow] ({n_matched} photo(s) restored"
+        if n_missing:
+            msg += f", {n_missing} no longer on disk and skipped"
+        console.print(msg + ")")
+
     # --- JSON output ---------------------------------------------------------
     if json_output:
         data = {
@@ -130,6 +140,7 @@ def main(
         mode=mode,
         output=str(effective_output),
         cache_db=cache_db_path(source),
+        draft_path=dp,
     )
     result = tui_app.run()
 
@@ -140,6 +151,8 @@ def main(
     clusters = result
 
     # --- Apply ---------------------------------------------------------------
+    if dp.exists():
+        dp.unlink()
     console.rule("[bold blue]Applying plan")
     undo_log = apply_plan(
         clusters,
