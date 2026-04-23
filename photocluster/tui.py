@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from datetime import datetime
 from typing import Literal, Optional
 
@@ -182,6 +183,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         Binding("k", "toggle_skip", "Skip/Accept"),
         Binding("m", "merge", "Merge"),
         Binding("s", "split", "Split"),
+        Binding("u", "undo", "Undo"),
         Binding("g", "go", "Go (apply)"),
         Binding("enter", "go", "Go (apply)", show=False),
         Binding("q", "quit_app", "Quit"),
@@ -210,6 +212,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         self._clusters = list(clusters)
         self._mode = mode
         self._output = output
+        self._undo_snapshot: Optional[list[Cluster]] = None
 
     # ------------------------------------------------------------------
     # Compose
@@ -221,7 +224,7 @@ class ClusterReviewApp(App[list[Cluster]]):
             f"  Mode: [bold]{self._mode}[/bold]   "
             f"Destination: [bold]{self._output}[/bold]   "
             f"  [dim]r[/dim]:Rename  [dim]k[/dim]:Skip  [dim]m[/dim]:Merge  [dim]s[/dim]:Split  "
-            f"[dim]g/Enter[/dim]:Apply  [dim]q[/dim]:Quit",
+            f"[dim]u[/dim]:Undo  [dim]g/Enter[/dim]:Apply  [dim]q[/dim]:Quit",
             id="info-bar",
             markup=True,
         )
@@ -289,6 +292,22 @@ class ClusterReviewApp(App[list[Cluster]]):
             table.update_cell(row_key, key, value, update_width=True)
 
     # ------------------------------------------------------------------
+    # Undo helpers
+    # ------------------------------------------------------------------
+
+    def _save_undo(self) -> None:
+        self._undo_snapshot = copy.deepcopy(self._clusters)
+
+    def action_undo(self) -> None:
+        if self._undo_snapshot is None:
+            self.notify("Nothing to undo.", severity="warning")
+            return
+        self._clusters = self._undo_snapshot
+        self._undo_snapshot = None
+        self._build_table()
+        self.notify("Undone.")
+
+    # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
 
@@ -302,12 +321,14 @@ class ClusterReviewApp(App[list[Cluster]]):
                 cluster.name = new_name
                 self._refresh_row(cluster)
 
+        self._save_undo()
         self.push_screen(RenameDialog(cluster.name), _apply)
 
     def action_toggle_skip(self) -> None:
         cluster = self._current_cluster()
         if cluster is None:
             return
+        self._save_undo()
         if cluster.action == "skip":
             cluster.action = "accept"
             cluster.merge_target_id = None
@@ -329,6 +350,7 @@ class ClusterReviewApp(App[list[Cluster]]):
                 cluster.merge_target_id = target_id
                 self._refresh_row(cluster)
 
+        self._save_undo()
         self.push_screen(MergeDialog(self._clusters, exclude_id=cluster.id), _apply)
 
     def action_split(self) -> None:
@@ -373,6 +395,7 @@ class ClusterReviewApp(App[list[Cluster]]):
             self._build_table()
             self.notify(f"Split into {len(before)} + {len(after)} photos.")
 
+        self._save_undo()
         self.push_screen(SplitDialog(), _apply)
 
     def action_go(self) -> None:
