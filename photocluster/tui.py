@@ -61,6 +61,11 @@ class RenameDialog(ModalScreen[Optional[str]]):
                 yield Button("OK", id="ok", variant="primary")
                 yield Button("Cancel", id="cancel")
 
+    def on_mount(self) -> None:
+        inp = self.query_one("#name-input", Input)
+        # No selection, cursor at end
+        inp.cursor_position = len(self._current)
+
     @on(Button.Pressed, "#ok")
     def _ok(self) -> None:
         self.dismiss(self.query_one("#name-input", Input).value.strip() or None)
@@ -116,10 +121,18 @@ class MergeDialog(ModalScreen[Optional[int]]):
         table.add_column("Photos", key="photos", width=8)
         for c in self._clusters:
             table.add_row(str(c.id), c.name, str(c.photo_count), key=str(c.id))
+        table.focus()
 
-    @on(DataTable.RowSelected, "#merge-table")
-    def _row_selected(self, event: DataTable.RowSelected) -> None:
-        self._selected_id = int(str(event.row_key.value))
+    # Track the highlighted row as the selection (arrow-key navigation works)
+    @on(DataTable.RowHighlighted, "#merge-table")
+    def _row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.row_key is not None:
+            self._selected_id = int(str(event.row_key.value))
+
+    def on_key(self, event) -> None:
+        if event.key == "enter":
+            event.stop()
+            self.dismiss(self._selected_id)
 
     @on(Button.Pressed, "#ok")
     def _ok(self) -> None:
@@ -146,6 +159,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         Binding("r",     "rename",          "", show=False),
         Binding("k",     "toggle_skip",     "", show=False),
         Binding("m",     "merge",           "", show=False),
+        Binding("u",     "undo",            "", show=False),
         Binding("e",     "open_earliest",   "", show=False),
         Binding("b",     "open_middle",     "", show=False),
         Binding("l",     "open_latest",     "", show=False),
@@ -230,6 +244,8 @@ class ClusterReviewApp(App[list[Cluster]]):
         self._selection: set[str] = set()
         self._cache_db = cache_db
         self._draft_path = draft_path
+        self._suppress_cluster_highlight = False
+        self._undo_stack: list[list[Cluster]] = []
 
     # ------------------------------------------------------------------
     # Compose
@@ -256,7 +272,7 @@ class ClusterReviewApp(App[list[Cluster]]):
                             id="preview-placeholder",
                         )
             yield Static(
-                "  r:Rename  k:Skip  m:Merge"
+                "  r:Rename  k:Skip  m:Merge  u:Undo"
                 "  |  "
                 "e:Earliest  b:Bisect  l:Latest  n:Next day"
                 "  |  "
@@ -302,6 +318,14 @@ class ClusterReviewApp(App[list[Cluster]]):
             if current is not None:
                 select_cluster_id = current.id
 
+        # Suppress RowHighlighted for the entire rebuild:
+        # - first add_row fires one event (row 0 auto-highlighted on non-empty table)
+        # - move_cursor fires a second event
+        # Both must be suppressed or the files table gets repopulated for the wrong cluster.
+        # call_after_refresh clears the flag once all queued events have drained.
+        self._suppress_cluster_highlight = True
+        self.call_after_refresh(self._end_suppress_cluster_highlight)
+
         self._sort_clusters()
         table.clear(columns=True)
         table.add_column("#", key="id", width=5)
@@ -318,6 +342,9 @@ class ClusterReviewApp(App[list[Cluster]]):
                 if c.id == select_cluster_id:
                     table.move_cursor(row=i)
                     break
+
+    def _end_suppress_cluster_highlight(self) -> None:
+        self._suppress_cluster_highlight = False
 
     def _row_cells(self, c: Cluster) -> tuple:
         start, end = c.date_range
@@ -336,10 +363,6 @@ class ClusterReviewApp(App[list[Cluster]]):
     def _status_label(self, c: Cluster) -> Text:
         if c.action == "skip":
             return Text("Skip", style="dim")
-        if c.action == "merge" and c.merge_target_id is not None:
-            target = self._cluster_by_id(c.merge_target_id)
-            label = target.name[:14] + "…" if target and len(target.name) > 14 else (target.name if target else "?")
-            return Text(f"Merge→ {label}", style="cyan")
         return Text("Accept", style="bold green")
 
     def _adjacent_cluster_id(self, cid: int) -> Optional[int]:
@@ -373,6 +396,8 @@ class ClusterReviewApp(App[list[Cluster]]):
 
     @on(DataTable.RowHighlighted, "#cluster-table")
     def _on_cluster_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self._suppress_cluster_highlight:
+            return
         if event.row_key is None:
             return
         cluster = self._cluster_by_id(int(str(event.row_key.value)))
@@ -470,6 +495,42 @@ class ClusterReviewApp(App[list[Cluster]]):
     # Actions
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Undo
+    # ------------------------------------------------------------------
+
+    _MAX_UNDO = 50
+
+    def _push_undo(self) -> None:
+        snapshot = [
+            Cluster(
+                id=c.id,
+                name=c.name,
+                photos=list(c.photos),
+                centroid_lat=c.centroid_lat,
+                centroid_lon=c.centroid_lon,
+                locked=c.locked,
+                action=c.action,
+                merge_target_id=c.merge_target_id,
+            )
+            for c in self._clusters
+        ]
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > self._MAX_UNDO:
+            self._undo_stack.pop(0)
+
+    def action_undo(self) -> None:
+        if not self._undo_stack:
+            self.notify("Nothing to undo.", severity="warning")
+            return
+        self._clusters = self._undo_stack.pop()
+        self._selection.clear()
+        self._build_table()
+        cluster = self._current_cluster()
+        if cluster:
+            self._populate_files_table(cluster)
+        self.notify(f"Undone. ({len(self._undo_stack)} step(s) remaining)")
+
     def action_focus_left(self) -> None:
         files_table = self.query_one("#files-table", DataTable)
         if self.focused is files_table:
@@ -487,6 +548,7 @@ class ClusterReviewApp(App[list[Cluster]]):
 
         def _apply(new_name: Optional[str]) -> None:
             if new_name:
+                self._push_undo()
                 cluster.name = new_name
                 self._refresh_row(cluster)
 
@@ -496,9 +558,9 @@ class ClusterReviewApp(App[list[Cluster]]):
         cluster = self._current_cluster()
         if cluster is None:
             return
+        self._push_undo()
         if cluster.action == "skip":
             cluster.action = "accept"
-            cluster.merge_target_id = None
         else:
             cluster.action = "skip"
         self._refresh_row(cluster)
@@ -507,15 +569,26 @@ class ClusterReviewApp(App[list[Cluster]]):
         cluster = self._current_cluster()
         if cluster is None:
             return
-        if len([c for c in self._clusters if c.id != cluster.id]) == 0:
+        others = [c for c in self._clusters if c.id != cluster.id and c.action != "skip"]
+        if not others:
             self.notify("No other clusters to merge into.", severity="warning")
             return
 
         def _apply(target_id: Optional[int]) -> None:
-            if target_id is not None:
-                cluster.action = "merge"
-                cluster.merge_target_id = target_id
-                self._refresh_row(cluster)
+            if target_id is None:
+                return
+            target = self._cluster_by_id(target_id)
+            if target is None:
+                return
+            self._push_undo()
+            target.photos.extend(cluster.photos)
+            focus_id = self._adjacent_cluster_id(cluster.id)
+            self._clusters = [c for c in self._clusters if c.id != cluster.id]
+            self._build_table(select_cluster_id=focus_id)
+            new_current = self._current_cluster()
+            if new_current:
+                self._populate_files_table(new_current)
+            self.notify(f"Merged {cluster.photo_count} photo(s) into '{target.name[:30]}'.")
 
         self.push_screen(MergeDialog(self._clusters, exclude_id=cluster.id), _apply)
 
@@ -600,6 +673,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         def _apply(new_name: Optional[str]) -> None:
             if new_name is None:
                 return
+            self._push_undo()
             new_cluster.name = new_name
             cluster.photos = remaining
             self._clusters.append(new_cluster)
@@ -632,6 +706,7 @@ class ClusterReviewApp(App[list[Cluster]]):
             target = self._cluster_by_id(target_id)
             if target is None:
                 return
+            self._push_undo()
             cluster.photos = remaining
             target.photos.extend(selected)
             self._selection.clear()
@@ -649,6 +724,7 @@ class ClusterReviewApp(App[list[Cluster]]):
 
         files_table = self.query_one("#files-table", DataTable)
         saved_cursor = files_table.cursor_row
+        self._push_undo()
 
         if self._selection:
             to_remove = self._selection.copy()
@@ -700,6 +776,7 @@ class ClusterReviewApp(App[list[Cluster]]):
 
         files_table = self.query_one("#files-table", DataTable)
         saved_cursor = files_table.cursor_row
+        self._push_undo()
 
         if self._selection:
             to_move = {str(p.path) for p in cluster.photos if str(p.path) in self._selection}
@@ -707,6 +784,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         else:
             photos = self._sorted_photos_by_time(cluster)
             if not (0 <= saved_cursor < len(photos)):
+                self._undo_stack.pop()  # nothing happened, discard
                 return
             to_move = {str(photos[saved_cursor].path)}
 
@@ -813,22 +891,7 @@ class ClusterReviewApp(App[list[Cluster]]):
         self.notify(f"Draft saved to {self._draft_path.name}")
 
     def action_go(self) -> None:
-        self._resolve_merges()
         self.exit(self._clusters)
 
     def action_quit_app(self) -> None:
         self.exit([])  # empty list signals abort
-
-    # ------------------------------------------------------------------
-    # Merge resolution: move photos from merge-sources into their targets
-    # ------------------------------------------------------------------
-
-    def _resolve_merges(self) -> None:
-        to_remove: set[int] = set()
-        for cluster in self._clusters:
-            if cluster.action == "merge" and cluster.merge_target_id is not None:
-                target = self._cluster_by_id(cluster.merge_target_id)
-                if target is not None:
-                    target.photos.extend(cluster.photos)
-                to_remove.add(cluster.id)
-        self._clusters = [c for c in self._clusters if c.id not in to_remove]

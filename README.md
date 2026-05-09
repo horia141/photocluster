@@ -4,6 +4,8 @@ A CLI tool that scans a photo folder, clusters images by location and time, prop
 
 **Platform:** macOS / Linux · **Python:** 3.11+
 
+![photocluster TUI](shot.jpg)
+
 ## Installation
 
 ```bash
